@@ -1,26 +1,19 @@
 import "./style.css";
-import { eq } from "drizzle-orm";
-import { runMigrations } from "./db/migrate";
-import { db } from "./db/client";
-import { todosTable } from "./db/schema";
+import { db, type Todo } from "./db/client";
 
 async function initApp() {
-  // Run migrations to ensure tables exist
-  await runMigrations();
-
-  // Fetch existing todos
-  const todos = await db.select().from(todosTable);
-  console.log("Existing todos:", todos);
-
-  // Render app
+  // Render app shell
   document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
     <div>
-      <h1>PGlite + Drizzle Todo App</h1>
+      <h1>PGlite + Drizzle + Comlink</h1>
+      <p class="subtitle">Database runs in a Web Worker with live queries</p>
       <div class="card">
         <input type="text" id="todo-input" placeholder="Enter a todo..." />
         <button id="add-todo" type="button">Add Todo</button>
       </div>
-      <ul id="todo-list"></ul>
+      <ul id="todo-list">
+        <li class="loading">Loading...</li>
+      </ul>
     </div>
   `;
 
@@ -28,63 +21,73 @@ async function initApp() {
   const addButton = document.querySelector<HTMLButtonElement>("#add-todo")!;
   const todoList = document.querySelector<HTMLUListElement>("#todo-list")!;
 
-  async function renderTodos() {
-    const todos = await db.select().from(todosTable);
+  // Render function - called by live query subscription
+  function renderTodos(todos: Todo[]) {
+    if (todos.length === 0) {
+      todoList.innerHTML =
+        '<li class="empty">No todos yet. Add one above!</li>';
+      return;
+    }
+
     todoList.innerHTML = todos
       .map(
         (todo) => `
-        <li style="text-decoration: ${todo.completed ? "line-through" : "none"}">
-          ${todo.description}
-          <button data-id="${todo.id}" class="toggle-btn">
-            ${todo.completed ? "Undo" : "Done"}
-          </button>
-          <button data-id="${todo.id}" class="delete-btn">Delete</button>
+        <li class="${todo.completed ? "completed" : ""}">
+          <span class="todo-text">${todo.description}</span>
+          <div class="todo-actions">
+            <button data-id="${todo.id}" class="toggle-btn">
+              ${todo.completed ? "Undo" : "Done"}
+            </button>
+            <button data-id="${todo.id}" class="delete-btn">Delete</button>
+          </div>
         </li>
       `,
       )
       .join("");
   }
 
+  // Subscribe to live updates - this is the magic!
+  // The callback fires automatically whenever the data changes
+  const unsubscribe = await db.subscribe(renderTodos);
+
+  // Clean up on page unload
+  window.addEventListener("beforeunload", () => {
+    unsubscribe();
+  });
+
+  // Add todo
   addButton.addEventListener("click", async () => {
     const description = input.value.trim();
     if (description) {
-      await db.insert(todosTable).values({ description });
+      await db.addTodo(description);
       input.value = "";
-      await renderTodos();
+      // No need to manually re-render - live query handles it!
     }
   });
 
-  input.addEventListener("keypress", async (e) => {
+  input.addEventListener("keypress", (e) => {
     if (e.key === "Enter") {
       addButton.click();
     }
   });
 
+  // Toggle and delete handlers
   todoList.addEventListener("click", async (e) => {
     const target = e.target as HTMLElement;
     const id = Number(target.dataset.id);
 
     if (target.classList.contains("toggle-btn")) {
-      const [todo] = await db
-        .select()
-        .from(todosTable)
-        .where(eq(todosTable.id, id));
-      if (todo) {
-        await db
-          .update(todosTable)
-          .set({ completed: !todo.completed })
-          .where(eq(todosTable.id, id));
-        await renderTodos();
-      }
+      await db.toggleTodo(id);
+      // No need to manually re-render - live query handles it!
     }
 
     if (target.classList.contains("delete-btn")) {
-      await db.delete(todosTable).where(eq(todosTable.id, id));
-      await renderTodos();
+      await db.deleteTodo(id);
+      // No need to manually re-render - live query handles it!
     }
   });
 
-  await renderTodos();
+  console.log("App initialized with live queries!");
 }
 
 initApp().catch(console.error);
