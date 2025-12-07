@@ -1,328 +1,230 @@
-# PGlite + Drizzle + Comlink Worker Architecture
+# PGlite Worker Architecture
 
-This document explains the worker-based database architecture used in this project, featuring PGlite (in-browser PostgreSQL), Drizzle ORM, and Comlink for type-safe worker communication.
+This document explains the worker-based database architecture with the repository pattern.
 
 ## Overview
 
-The database runs entirely in a Web Worker, keeping the main thread free for UI rendering. Live queries automatically update the UI when data changes - no manual re-rendering required.
+The database runs in a Web Worker with automatic leader election for multi-tab support. Domain logic is organized using the repository pattern.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      Main Thread                             │
-│                                                              │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐   │
-│  │   main.ts    │───▶│  client.ts   │───▶│   Comlink    │   │
-│  │  (UI Logic)  │    │  (API Layer) │    │   (Proxy)    │   │
-│  └──────────────┘    └──────────────┘    └──────┬───────┘   │
-│                                                  │           │
-└──────────────────────────────────────────────────┼───────────┘
-                                                   │
-                                            postMessage
-                                                   │
-┌──────────────────────────────────────────────────┼───────────┐
-│                      Web Worker                  │           │
-│                                                  ▼           │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐   │
-│  │   Comlink    │───▶│  worker.ts   │───▶│   PGlite     │   │
-│  │  (Expose)    │    │  (DB Logic)  │    │  + Drizzle   │   │
-│  └──────────────┘    └──────────────┘    └──────────────┘   │
-│                                                  │           │
-│                                                  ▼           │
-│                                          ┌──────────────┐   │
-│                                          │  IndexedDB   │   │
-│                                          │ (Persistent) │   │
-│                                          └──────────────┘   │
-└──────────────────────────────────────────────────────────────┘
+src/
+├── workers/
+│   └── pglite.worker.ts     # PGlite worker with leader election
+├── db/
+│   ├── schema.ts            # Drizzle table definitions + types
+│   ├── client.ts            # DatabaseClient (base class)
+│   ├── index.ts             # Main exports
+│   └── repositories/
+│       ├── index.ts         # Repository exports
+│       └── todos.ts         # TodoRepository
+└── main.ts
 ```
 
-## File Structure
+## Architecture Diagram
 
 ```
-src/db/
-├── schema.ts   # Drizzle table definitions + TypeScript types
-├── worker.ts   # Web Worker: PGlite + Drizzle + live queries
-└── client.ts   # Main thread: Comlink wrapper with type-safe API
+┌─────────────────────────────────────────────────────────────────────┐
+│                           Main Thread                                │
+│                                                                      │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────────────┐ │
+│  │   main.ts    │────▶│ TodoRepository│────▶│   DatabaseClient    │ │
+│  │   (App UI)   │     │   (Domain)   │     │  (Query + LiveQuery) │ │
+│  └──────────────┘     └──────────────┘     └──────────┬───────────┘ │
+│                                                        │             │
+└────────────────────────────────────────────────────────┼─────────────┘
+                                                         │
+                                                    PGliteWorker
+                                                         │
+┌────────────────────────────────────────────────────────┼─────────────┐
+│                          Web Worker                    │             │
+│                                                        ▼             │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │                    pglite.worker.ts                              │ │
+│  │  ┌──────────────────┐    ┌──────────────────────────────────┐   │ │
+│  │  │      PGlite      │    │     Leader Election (auto)       │   │ │
+│  │  │   + Extensions   │    │  Only one tab runs the database  │   │ │
+│  │  └────────┬─────────┘    └──────────────────────────────────┘   │ │
+│  └───────────┼─────────────────────────────────────────────────────┘ │
+│              │                                                       │
+│              ▼                                                       │
+│  ┌──────────────────┐                                               │
+│  │    IndexedDB     │                                               │
+│  │   (Persistent)   │                                               │
+│  └──────────────────┘                                               │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-## How It Works
+## Components
 
-### 1. Schema Definition (`schema.ts`)
+### DatabaseClient (`db/client.ts`)
 
-Define your tables using Drizzle's type-safe schema builder:
+Base class that handles:
+- PGliteWorker initialization with multi-tab leader election
+- Generic `query<T>()` and `queryOne<T>()` methods
+- Live query subscriptions via `liveQuery<T>()`
+- Connection management and cleanup
 
 ```typescript
-import { integer, pgTable, varchar, boolean } from 'drizzle-orm/pg-core'
+import { db } from './db'
 
-export const todosTable = pgTable('todos', {
-  id: integer().primaryKey().generatedAlwaysAsIdentity(),
-  description: varchar('description', { length: 255 }).notNull(),
-  completed: boolean().notNull().default(false),
-})
+// Initialize once at app start
+await db.init()
 
-// Infer TypeScript types from the table
-export type Todo = typeof todosTable.$inferSelect
-export type NewTodo = typeof todosTable.$inferInsert
+// Generic queries
+const users = await db.query<User>('SELECT * FROM users')
+const user = await db.queryOne<User>('SELECT * FROM users WHERE id = $1', [1])
+
+// Live queries
+const unsubscribe = await db.liveQuery<Todo>(
+  'SELECT * FROM todos ORDER BY id DESC',
+  [],
+  (todos) => renderTodos(todos)
+)
 ```
 
-### 2. Worker (`worker.ts`)
+### Repositories (`db/repositories/`)
 
-The worker initializes PGlite with the live extension and exposes methods via Comlink:
+Domain-specific classes that encapsulate entity operations:
+
+```typescript
+import { todos } from './db'
+
+// CRUD operations
+const allTodos = await todos.getAll()
+const newTodo = await todos.add('Learn PGlite')
+await todos.toggle(1)
+await todos.delete(1)
+
+// Live subscription
+const unsubscribe = await todos.subscribe((todoList) => {
+  renderTodos(todoList)
+})
+```
+
+### Worker (`workers/pglite.worker.ts`)
+
+Uses PGlite's built-in `worker()` wrapper for:
+- Leader election across browser tabs
+- Automatic failover when leader tab closes
+- Database initialization and migrations
 
 ```typescript
 import { PGlite } from '@electric-sql/pglite'
 import { live } from '@electric-sql/pglite/live'
-import { drizzle } from 'drizzle-orm/pglite'
-import * as Comlink from 'comlink'
+import { worker } from '@electric-sql/pglite/worker'
 
-class DatabaseWorker {
-  private client: PGlite | null = null
-  private db: ReturnType<typeof drizzle> | null = null
-
-  async init() {
-    // Create PGlite with live extension and IndexedDB persistence
-    this.client = await PGlite.create({
-      dataDir: 'idb://my-database',
+worker({
+  async init(options) {
+    const pg = await PGlite.create({
+      dataDir: options?.dataDir ?? 'idb://my-db',
       extensions: { live },
     })
     
-    this.db = drizzle(this.client, { schema })
-    
     // Run migrations
-    await this.client.exec(`CREATE TABLE IF NOT EXISTS ...`)
-  }
-
-  // CRUD operations using Drizzle
-  async getAllTodos() {
-    return this.db.select().from(todosTable)
-  }
-
-  async addTodo(description: string) {
-    return this.db.insert(todosTable).values({ description }).returning()
-  }
-
-  // Live query subscription
-  async subscribeTodos(callback: (todos: Todo[]) => void) {
-    const liveQuery = await this.client.live.query(
-      'SELECT * FROM todos ORDER BY id DESC',
-      [],
-      (results) => callback(results.rows)
-    )
+    await pg.exec(`CREATE TABLE IF NOT EXISTS ...`)
     
-    // Return initial results immediately
-    callback(liveQuery.initialResults.rows)
-    
-    return subscriptionId // For cleanup
-  }
-}
-
-Comlink.expose(new DatabaseWorker())
-```
-
-### 3. Client (`client.ts`)
-
-The client wraps the worker with Comlink, providing a clean async API:
-
-```typescript
-import * as Comlink from 'comlink'
-import type { DbWorker } from './worker'
-import DbWorkerModule from './worker?worker'  // Vite worker import
-
-class DatabaseClient {
-  private worker: Comlink.Remote<DbWorker>
-  private initPromise: Promise<void>
-
-  constructor() {
-    const rawWorker = new DbWorkerModule()
-    this.worker = Comlink.wrap<DbWorker>(rawWorker)
-    this.initPromise = this.worker.init()
-  }
-
-  async getAllTodos() {
-    await this.initPromise
-    return this.worker.getAllTodos()
-  }
-
-  async subscribe(callback: (todos: Todo[]) => void) {
-    await this.initPromise
-    
-    // Comlink.proxy allows callbacks to work across worker boundary
-    const subscriptionId = await this.worker.subscribeTodos(
-      Comlink.proxy(callback)
-    )
-    
-    // Return unsubscribe function
-    return () => this.worker.unsubscribe(subscriptionId)
-  }
-}
-
-export const db = new DatabaseClient()
-```
-
-### 4. Usage in Main Thread (`main.ts`)
-
-```typescript
-import { db, type Todo } from './db/client'
-
-async function initApp() {
-  // Subscribe to live updates - callback fires automatically on changes
-  const unsubscribe = await db.subscribe((todos: Todo[]) => {
-    renderTodos(todos)  // Re-render UI with new data
-  })
-
-  // CRUD operations - no manual re-render needed!
-  await db.addTodo('Learn PGlite')     // UI updates automatically
-  await db.toggleTodo(1)                // UI updates automatically
-  await db.deleteTodo(1)                // UI updates automatically
-
-  // Cleanup on page unload
-  window.addEventListener('beforeunload', unsubscribe)
-}
-```
-
-## Key Concepts
-
-### Live Queries
-
-PGlite's live extension watches for changes to the underlying tables and re-runs the query automatically:
-
-```typescript
-const liveQuery = await client.live.query(
-  'SELECT * FROM todos',
-  [],
-  (results) => {
-    // This callback fires EVERY TIME the todos table changes
-    console.log('Data updated:', results.rows)
-  }
-)
-
-// Initial results available immediately
-console.log('Initial:', liveQuery.initialResults.rows)
-
-// Stop listening
-await liveQuery.unsubscribe()
-```
-
-### Comlink Proxies
-
-Comlink normally can't send functions across the worker boundary. Use `Comlink.proxy()` to wrap callbacks:
-
-```typescript
-// Main thread
-await worker.subscribe(Comlink.proxy((data) => {
-  console.log('Received:', data)
-}))
-
-// Worker
-async subscribe(callback: (data: any) => void) {
-  // callback works even though it was defined in main thread!
-  callback({ message: 'Hello from worker' })
-}
-```
-
-### Type Safety
-
-The worker exports its type, which the client uses for full TypeScript inference:
-
-```typescript
-// worker.ts
-export type DbWorker = typeof worker
-
-// client.ts
-import type { DbWorker } from './worker'
-const worker = Comlink.wrap<DbWorker>(rawWorker)
-
-// Full autocomplete and type checking!
-const todos = await worker.getAllTodos()  // Todo[]
-```
-
-## Vite Configuration
-
-Workers require specific Vite config:
-
-```typescript
-// vite.config.ts
-import { defineConfig } from 'vite'
-
-export default defineConfig({
-  optimizeDeps: {
-    exclude: ['@electric-sql/pglite'],  // Required for PGlite
-  },
-  worker: {
-    format: 'es',  // Required for ES module workers
+    return pg
   },
 })
 ```
 
-## Benefits
+## Adding a New Repository
+
+1. **Define schema** in `db/schema.ts`:
+
+```typescript
+export const usersTable = pgTable('users', {
+  id: integer().primaryKey().generatedAlwaysAsIdentity(),
+  name: varchar('name', { length: 255 }).notNull(),
+  email: varchar('email', { length: 255 }).notNull(),
+})
+
+export type User = typeof usersTable.$inferSelect
+```
+
+2. **Create repository** in `db/repositories/users.ts`:
+
+```typescript
+import type { DatabaseClient } from '../client'
+import type { User } from '../schema'
+
+export class UserRepository {
+  private db: DatabaseClient
+
+  constructor(db: DatabaseClient) {
+    this.db = db
+  }
+
+  async getAll(): Promise<User[]> {
+    return this.db.query<User>('SELECT * FROM users ORDER BY name')
+  }
+
+  async add(name: string, email: string): Promise<User> {
+    const rows = await this.db.query<User>(
+      'INSERT INTO users (name, email) VALUES ($1, $2) RETURNING *',
+      [name, email]
+    )
+    return rows[0]
+  }
+
+  async subscribe(callback: (users: User[]) => void) {
+    return this.db.liveQuery<User>(
+      'SELECT * FROM users ORDER BY name',
+      [],
+      callback
+    )
+  }
+}
+```
+
+3. **Export from index** in `db/repositories/index.ts`:
+
+```typescript
+import { db } from '../client'
+import { TodoRepository } from './todos'
+import { UserRepository } from './users'
+
+export const todos = new TodoRepository(db)
+export const users = new UserRepository(db)
+
+export { TodoRepository, UserRepository }
+```
+
+4. **Re-export from main** in `db/index.ts`:
+
+```typescript
+export { todos, users, TodoRepository, UserRepository } from './repositories'
+export type { User } from './schema'
+```
+
+5. **Add migration** in `workers/pglite.worker.ts`:
+
+```typescript
+await pg.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    name VARCHAR(255) NOT NULL,
+    email VARCHAR(255) NOT NULL
+  );
+`)
+```
+
+## Multi-Tab Behavior
+
+- **Leader Election**: Only one tab runs the actual PGlite database
+- **Automatic Proxy**: Other tabs proxy queries through the leader
+- **Failover**: When leader closes, a new leader is elected
+- **Live Sync**: Changes propagate to all tabs instantly
+
+This is handled automatically by `PGliteWorker` - no manual configuration needed.
+
+## Key Benefits
 
 | Benefit | Description |
 |---------|-------------|
-| **Non-blocking** | Database operations don't freeze the UI |
-| **Type-safe** | Full TypeScript inference across worker boundary |
-| **Reactive** | Live queries auto-update UI on data changes |
-| **Persistent** | IndexedDB storage survives page refreshes |
-| **SQL Power** | Full PostgreSQL in the browser via PGlite |
-
-## Debugging
-
-Open browser DevTools and look for:
-
-- **Console logs** prefixed with `[Worker]` for worker activity
-- **Application > IndexedDB** to inspect stored data
-- **Sources > worker.ts** to debug worker code
-
-## Common Patterns
-
-### Error Handling
-
-```typescript
-// client.ts
-async addTodo(description: string) {
-  try {
-    await this.ensureReady()
-    return await this.worker.addTodo(description)
-  } catch (error) {
-    console.error('Failed to add todo:', error)
-    throw error
-  }
-}
-```
-
-### Multiple Subscriptions
-
-```typescript
-// Subscribe to different queries
-const unsubTodos = await db.subscribeTodos(renderTodos)
-const unsubUsers = await db.subscribeUsers(renderUsers)
-
-// Cleanup all
-window.addEventListener('beforeunload', () => {
-  unsubTodos()
-  unsubUsers()
-})
-```
-
-### Optimistic Updates
-
-```typescript
-async function addTodo(description: string) {
-  // Optimistically update UI
-  const tempTodo = { id: -1, description, completed: false }
-  setTodos(prev => [tempTodo, ...prev])
-  
-  try {
-    await db.addTodo(description)
-    // Live query will replace temp with real data
-  } catch (error) {
-    // Revert on failure
-    setTodos(prev => prev.filter(t => t.id !== -1))
-  }
-}
-```
-
-## Next Steps
-
-- Add more tables and relationships
-- Implement Electric SQL sync for server synchronization
-- Add offline queue for operations when offline
-- Explore SharedWorker for multi-tab support
+| **Separation of Concerns** | Workers in `/workers`, DB logic in `/db` |
+| **Repository Pattern** | Domain logic encapsulated in repositories |
+| **Type Safety** | Full TypeScript inference throughout |
+| **Multi-Tab** | Automatic leader election, no conflicts |
+| **Live Queries** | Reactive updates across all tabs |
+| **Extensible** | Easy to add new repositories |

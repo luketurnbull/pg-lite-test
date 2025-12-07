@@ -27,16 +27,6 @@ Use cases:
 - Breaking down complex problems
 - Designing architecture decisions
 
-Example:
-```
-mcp__sequential-thinking__sequentialthinking({
-  thought: "Analyzing the best approach for...",
-  thoughtNumber: 1,
-  totalThoughts: 4,
-  nextThoughtNeeded: true
-})
-```
-
 ## Commands
 
 - `bun dev` - Start Vite development server
@@ -45,21 +35,20 @@ mcp__sequential-thinking__sequentialthinking({
 
 ## Architecture
 
-This is a local-first Vite + TypeScript application using PGlite (in-browser PostgreSQL) with Drizzle ORM, running in a Web Worker with Comlink for type-safe communication.
+Local-first Vite + TypeScript application using PGlite (in-browser PostgreSQL) with multi-tab support and repository pattern.
 
 ```
-Main Thread                          Web Worker
-┌─────────────────┐                 ┌─────────────────┐
-│    main.ts      │                 │    worker.ts    │
-│    (UI Logic)   │                 │    (Database)   │
-│        │        │                 │        │        │
-│        ▼        │   Comlink RPC   │        ▼        │
-│    client.ts    │◄───────────────►│    PGlite +     │
-│    (API Layer)  │                 │    Drizzle      │
-└─────────────────┘                 └────────┬────────┘
-                                             │
-                                             ▼
-                                       IndexedDB
+src/
+├── workers/
+│   └── pglite.worker.ts     # PGlite worker with leader election
+├── db/
+│   ├── schema.ts            # Drizzle table definitions + types
+│   ├── client.ts            # DatabaseClient (base class)
+│   ├── index.ts             # Main exports
+│   └── repositories/
+│       ├── index.ts         # Repository exports
+│       └── todos.ts         # TodoRepository
+└── main.ts
 ```
 
 ### Key Technologies
@@ -67,8 +56,8 @@ Main Thread                          Web Worker
 | Technology | Purpose |
 |------------|---------|
 | **PGlite** (`@electric-sql/pglite`) | PostgreSQL in WASM, runs in browser |
-| **Drizzle ORM** | Type-safe SQL queries and schema |
-| **Comlink** | Type-safe RPC for Web Workers |
+| **PGliteWorker** | Multi-tab leader election and worker management |
+| **Drizzle ORM** | Type-safe schema definitions |
 | **Vite** (rolldown-vite) | Build tool with worker support |
 
 ### Database Layer (`src/db/`)
@@ -76,45 +65,50 @@ Main Thread                          Web Worker
 | File | Purpose |
 |------|---------|
 | `schema.ts` | Drizzle table definitions + TypeScript types |
-| `worker.ts` | Web Worker with PGlite + Drizzle + live queries |
-| `client.ts` | Main thread API wrapper using Comlink |
+| `client.ts` | DatabaseClient with query/liveQuery methods |
+| `index.ts` | Main exports |
+| `repositories/*.ts` | Domain-specific repository classes |
+
+### Workers (`src/workers/`)
+
+| File | Purpose |
+|------|---------|
+| `pglite.worker.ts` | PGlite worker with leader election |
 
 ### Key Patterns
 
-**Live Queries**: The database supports reactive queries that automatically notify subscribers when data changes:
+**Repository Pattern**: Domain logic encapsulated in repository classes:
 
 ```typescript
-const unsubscribe = await db.subscribe((todos) => {
-  renderTodos(todos)  // Called automatically on any change
+import { db, todos } from './db'
+
+await db.init()
+const unsubscribe = await todos.subscribe(renderTodos)
+await todos.add('New todo')
+```
+
+**Live Queries**: Reactive queries that sync across ALL tabs:
+
+```typescript
+const unsubscribe = await todos.subscribe((todoList) => {
+  renderTodos(todoList)  // Called in ALL tabs when data changes
 })
 ```
 
-**Worker Communication**: All database calls go through Comlink for type safety:
-
-```typescript
-// client.ts wraps worker methods
-await db.addTodo('New todo')  // Type-safe, runs in worker
-```
-
-**Persistence**: Data is stored in IndexedDB via `idb://` prefix and survives page refreshes.
+**Multi-Tab**: Automatic leader election handled by PGliteWorker.
 
 ## Documentation
 
 See `docs/` for detailed documentation:
-- `WORKER_ARCHITECTURE.md` - How the worker pattern works
-- `PGLITE_DRIZZLE_PLAN.md` - Initial implementation plan
+- `WORKER_ARCHITECTURE.md` - Repository pattern and worker setup
+- `DRIZZLE_PGLITE_LIVE_QUERIES.md` - Why Drizzle lacks native live query support
 - `ADVANCED_PGLITE_PATTERNS.md` - Live queries, sync, GPU acceleration
 - `ULTIMATE_LOCAL_FIRST_STACK.md` - Full stack architecture vision
-- `DRIZZLE_PGLITE_LIVE_QUERIES.md` - Why Drizzle lacks native live query support (with sources)
 
 ## Known Limitations
 
 ### Drizzle + PGlite Live Queries
-Drizzle ORM does **not** have native live query integration with PGlite. The current implementation uses a hybrid approach:
-- Drizzle for CRUD operations (type-safe)
-- Raw SQL for live subscriptions (loses type safety)
-
-See `docs/DRIZZLE_PGLITE_LIVE_QUERIES.md` for full analysis and alternatives (including Kysely which does have native support).
+Drizzle ORM does **not** have native live query integration with PGlite. Repositories use raw SQL for live subscriptions. See `docs/DRIZZLE_PGLITE_LIVE_QUERIES.md` for alternatives.
 
 ### Optimistic Updates
-Optimistic updates are **not needed** for local-only PGlite with live queries. The live query subscription automatically updates the UI when data changes (~50ms latency). Optimistic updates are only relevant when adding remote sync (e.g., Electric SQL).
+Not needed for local-only PGlite with live queries. The live query subscription automatically updates the UI when data changes (~50ms latency).

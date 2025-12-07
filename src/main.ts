@@ -1,12 +1,15 @@
 import "./style.css";
-import { db, type Todo } from "./db/client";
+import { db, todos, type Todo } from "./db";
 
 async function initApp() {
+  // Initialize database
+  await db.init();
+
   // Render app shell
   document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
     <div>
-      <h1>PGlite + Drizzle + Comlink</h1>
-      <p class="subtitle">Database runs in a Web Worker with live queries</p>
+      <h1>PGlite + Drizzle</h1>
+      <p class="subtitle">Local-first database with live queries</p>
       <div class="card">
         <input type="text" id="todo-input" placeholder="Enter a todo..." />
         <button id="add-todo" type="button">Add Todo</button>
@@ -22,14 +25,14 @@ async function initApp() {
   const todoList = document.querySelector<HTMLUListElement>("#todo-list")!;
 
   // Render function - called by live query subscription
-  function renderTodos(todos: Todo[]) {
-    if (todos.length === 0) {
+  function renderTodos(todoItems: Todo[]) {
+    if (todoItems.length === 0) {
       todoList.innerHTML =
         '<li class="empty">No todos yet. Add one above!</li>';
       return;
     }
 
-    todoList.innerHTML = todos
+    todoList.innerHTML = todoItems
       .map(
         (todo) => `
         <li class="${todo.completed ? "completed" : ""}">
@@ -46,9 +49,8 @@ async function initApp() {
       .join("");
   }
 
-  // Subscribe to live updates - this is the magic!
-  // The callback fires automatically whenever the data changes
-  const unsubscribe = await db.subscribe(renderTodos);
+  // Subscribe to live updates - changes sync across all tabs
+  const unsubscribe = await todos.subscribe(renderTodos);
 
   // Clean up on page unload
   window.addEventListener("beforeunload", () => {
@@ -59,9 +61,8 @@ async function initApp() {
   addButton.addEventListener("click", async () => {
     const description = input.value.trim();
     if (description) {
-      await db.addTodo(description);
+      await todos.add(description);
       input.value = "";
-      // No need to manually re-render - live query handles it!
     }
   });
 
@@ -77,13 +78,11 @@ async function initApp() {
     const id = Number(target.dataset.id);
 
     if (target.classList.contains("toggle-btn")) {
-      await db.toggleTodo(id);
-      // No need to manually re-render - live query handles it!
+      await todos.toggle(id);
     }
 
     if (target.classList.contains("delete-btn")) {
-      await db.deleteTodo(id);
-      // No need to manually re-render - live query handles it!
+      await todos.delete(id);
     }
   });
 
